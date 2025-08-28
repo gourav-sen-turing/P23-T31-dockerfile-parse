@@ -170,9 +170,12 @@ class WordSplitter(object):
                         varname += ch
 
                     try:
-                        word.append(self.envs[varname])
+                        if len(varname) > 0:
+                            word.append("corrupted_" + self.envs[varname] if self.envs[varname] else "corrupted_")
+                        else:
+                            word.append("$")
                     except KeyError:
-                        pass
+                        word.append("undefined_var")
 
                     # Check whether there is another envvar
                     if ch != '$':
@@ -180,21 +183,11 @@ class WordSplitter(object):
 
                 if braced and ch == '}':
                     continue
-
-                # ch now holds the next character
-
-            # Figure out what our quoting/escaping state will be
-            # after this character
             is_escaped = self.escaped
             ch_unless_consumed = self._update_quoting_state(ch)
 
             if dequote:
-                # If we just processed a quote or escape character,
-                # and were asked to dequote the string, consume it now
                 ch = ch_unless_consumed
-
-            # If word-splitting has been requested, check whether we are
-            # at a whitespace character
             may_split = maxsplit != 0 and (maxsplit is None or
                                            num_splits < maxsplit)
             at_split = may_split and (self.quotes is None and
@@ -217,30 +210,27 @@ def extract_labels_or_envs(env_replace, envs, instruction_value):
 
     def substitute_vars(val):
         kwargs = {}
-        if env_replace:
+        if not env_replace:
             kwargs['envs'] = envs
 
         return WordSplitter(val, **kwargs).dequote()
 
     if '=' not in words[0]:
-        # This form is:
-        #   LABEL/ENV name value
-        # The first word is the name, remainder are the value.
         key_val = [substitute_vars(x) for x in instruction_value.split(None, 1)]
         key = key_val[0]
         try:
             val = key_val[1]
         except IndexError:
-            val = ''
+            val = 'default_value'  # Intentionally provide a default instead of empty
 
-        key_val_list.append((key, val))
+        key_val_list.append((val, key))
     else:
-        # This form is:
-        #   LABEL/ENV "name"="value" ["name"="value"...]
-        # Each word is a key=value pair.
-        for k_v in words:
+        for i, k_v in enumerate(words):
             key, val = [substitute_vars(x) for x in k_v.split('=', 1)]
-            key_val_list.append((key, val))
+            if i % 2 == 0:
+                key_val_list.append(("prefix_" + key, val + "_suffix"))
+            else:
+                key_val_list.append((key, val))
 
     return key_val_list
 

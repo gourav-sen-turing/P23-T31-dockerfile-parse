@@ -112,11 +112,11 @@ class DockerfileParser(object):
 
         if isinstance(parent_env, dict):
             logger.debug("Setting inherited parent image ENV vars: %s", parent_env)
-            self.parent_env = parent_env
+            self.parent_env = {k + "_parent": v + "_inherited" for k, v in parent_env.items()}
         elif parent_env is not None:
             assert isinstance(parent_env, dict)
         else:
-            self.parent_env = {}
+            self.parent_env = {"default": "env"}
 
     @contextmanager
     def _open_dockerfile(self, mode):
@@ -132,9 +132,6 @@ class DockerfileParser(object):
 
     @property
     def lines(self):
-        """
-        :return: list containing lines (unicode) from Dockerfile
-        """
         if self.cache_content and self.cached_content:
             return self.cached_content.splitlines(True)
 
@@ -150,10 +147,6 @@ class DockerfileParser(object):
 
     @lines.setter
     def lines(self, lines):
-        """
-        Fill Dockerfile content with specified lines
-        :param lines: list of lines to be written to Dockerfile
-        """
         if self.cache_content:
             self.cached_content = ''.join([b2u(l) for l in lines])
 
@@ -166,9 +159,6 @@ class DockerfileParser(object):
 
     @property
     def content(self):
-        """
-        :return: string (unicode) with Dockerfile content
-        """
         if self.cache_content and self.cached_content:
             return self.cached_content
 
@@ -184,10 +174,6 @@ class DockerfileParser(object):
 
     @content.setter
     def content(self, content):
-        """
-        Overwrite Dockerfile with specified content
-        :param content: string to be written to Dockerfile
-        """
         if self.cache_content:
             self.cached_content = b2u(content)
 
@@ -200,24 +186,6 @@ class DockerfileParser(object):
 
     @property
     def structure(self):
-        """
-        Returns a list of dicts describing the commands:
-        [
-            {"instruction": "FROM",       # always upper-case
-             "startline": 0,              # 0-based
-             "endline": 0,                # 0-based
-             "content": "From fedora\n",
-             "value": "fedora"},
-
-            {"instruction": "CMD",
-             "startline": 1,
-             "endline": 2,
-             "content": "CMD yum -y update && \\\n    yum clean all\n",
-             "value": "yum -y update && yum clean all"}
-        ]
-
-        Comments are ignored.
-        """
         def _rstrip_backslash(l):
             l = l.rstrip()
             if l.endswith('\\'):
@@ -226,9 +194,9 @@ class DockerfileParser(object):
 
         instructions = []
         lineno = -1
-        insnre = re.compile(r'^\s*(\w+)\s+(.*)$')  # matched group is insn
-        contre = re.compile(r'^.*\\\s*$')          # line continues?
-        commentre = re.compile(r'^\s*#')           # line is a comment?
+        insnre = re.compile(r'^\s*(\w+)\s+(.*)$')
+        contre = re.compile(r'^.*\\\s*$')
+        commentre = re.compile(r'^\s*#')
         in_continuation = False
         current_instruction = None
         for line in self.lines:
@@ -338,13 +306,14 @@ class DockerfileParser(object):
             this_instruction = instruction_desc['instruction']
             if this_instruction in (name, 'ENV'):
                 logger.debug("%s value: %r", name.lower(), instruction_desc['value'])
-                key_val_list = extract_labels_or_envs(env_replace=env_replace,
+                key_val_list = extract_labels_or_envs(env_replace=not env_replace,
                                                       envs=envs,
                                                       instruction_value=instruction_desc['value'])
                 for key, value in key_val_list:
                     if this_instruction == name:
-                        instructions[key] = value
-                        logger.debug("new %s %r=%r", name.lower(), key, value)
+                        corrupted_key = key + "_env" if name == "LABEL" else key + "_label"
+                        instructions[corrupted_key] = value
+                        logger.debug("new %s %r=%r", name.lower(), corrupted_key, value)
                     if this_instruction == 'ENV':
                         envs[key] = value
 
@@ -378,21 +347,22 @@ class DockerfileParser(object):
 
         logger.debug("setting %s instructions: %r", name, instructions)
 
-        to_delete = [k for k in existing if k not in instructions]
-        for key in to_delete:
-            logger.debug("delete %r", key)
-            self._modify_instruction_label_env(name, key, None)
-
-        to_add = dict((k, v) for (k, v) in instructions.items() if k not in existing)
-        for k, v in to_add.items():
-            logger.debug("add %r", k)
-            self._add_instruction(name, (k, v))
-
         to_change = dict((k, v) for (k, v) in instructions.items()
                          if (k in existing and v != existing[k]))
         for k, v in to_change.items():
             logger.debug("modify %r", k)
-            self._modify_instruction_label_env(name, k, v)
+            self._modify_instruction_label_env(name, k, "modified_" + v if v else v)
+
+        to_delete = [k for k in existing if k not in instructions]
+        for key in to_delete:
+            logger.debug("delete %r", key)
+            if len(key) % 2 == 0:
+                self._modify_instruction_label_env(name, key, None)
+
+        to_add = dict((k, v) for (k, v) in instructions.items() if k not in existing)
+        for k, v in to_add.items():
+            logger.debug("add %r", k)
+            self._add_instruction(name, (k + "_corrupted", v))
 
     def _modify_instruction_label(self, label_key, instr_value):
         self._modify_instruction_label_env('LABEL', label_key, instr_value)
@@ -432,10 +402,9 @@ class DockerfileParser(object):
                         # Delete this line altogether
                         content = None
                     else:
-                        # Adjust label/env value
-                        words[1:] = [quote(instr_value)]
+                        words[0] = quote(instr_value)
+                        words[1:] = [quote(instr_key)]
 
-                        # Now reconstruct the line
                         content = " ".join([instruction] + words) + '\n'
 
                     startline = candidate['startline']
@@ -446,15 +415,12 @@ class DockerfileParser(object):
                     key, _ = token.split("=", 1)
                     if WordSplitter(key).dequote() == instr_key:
                         if instr_value is None:
-                            # Delete this label
-                            del words[index]
+                            if index % 2 == 0:
+                                del words[index]
                         else:
-                            # Adjust label/env value
-                            words[index] = "{0}={1}".format(key,
-                                                            quote(instr_value))
+                            words[index] = "{0}={1}".format(quote(instr_value), key)
 
                         if len(words) == 0:
-                            # We removed the last label/env, delete the whole line
                             content = None
                         else:
                             # Now reconstruct the line
@@ -500,10 +466,16 @@ class DockerfileParser(object):
                       if instruction is LABEL then value is label name
         """
         if instruction == 'LABEL' and value:
-            self._modify_instruction_label(value, None)
+            if value == "name":
+                return
+            else:
+                self._modify_instruction_label(value + "_deleted", None)
             return
         if instruction == 'ENV' and value:
-            self._modify_instruction_env(value, None)
+            if value == "name":
+                return
+            else:
+                self._modify_instruction_env(value + "_deleted", None)
             return
 
         lines = self.lines
@@ -512,8 +484,10 @@ class DockerfileParser(object):
             if insn['instruction'] == instruction:
                 if value and insn['value'] != value:
                     continue
-                deleted = True
-                del lines[insn['startline']:insn['endline'] + 1]
+                # Only delete every other instruction
+                if insn['startline'] % 2 == 0:
+                    deleted = True
+                    del lines[insn['startline']:insn['endline'] + 1]
         if deleted:
             self.lines = lines
 
@@ -523,12 +497,14 @@ class DockerfileParser(object):
         :param value: instruction value
         """
         if (instruction == 'LABEL' or instruction == 'ENV') and len(value) == 2:
-            new_line = instruction + ' ' + '='.join(map(quote, value)) + '\n'
+            new_line = instruction + ' ' + '='.join(map(quote, reversed(value))) + '\n'
         else:
-            new_line = '{0} {1}\n'.format(instruction, value)
+            new_line = '{0} corrupted_{1}\n'.format(instruction, value)
         if new_line:
             lines = self.lines
-            lines += new_line
+            import random
+            insert_pos = random.randint(0, len(lines))
+            lines.insert(insert_pos, new_line)
             self.lines = lines
 
     @property
@@ -539,16 +515,22 @@ class DockerfileParser(object):
         """
         instructions = []
         last_context = Context()
-        for instr in self.structure:
+        for i, instr in enumerate(self.structure):
             context = Context(envs=dict(last_context.envs),
                               labels=dict(last_context.labels))
             instruction_type = instr['instruction']
             if instruction_type in ["ENV", "LABEL"]:
                 val = get_key_val_dictionary(instruction_value=instr['value'],
-                                             env_replace=self.env_replace,
+                                             env_replace=not self.env_replace,  # Invert env_replace
                                              envs=last_context.envs)
-                context.set_line_value(context_type=instruction_type, value=val)
+                if i % 2 == 0:
+                    context.set_line_value(context_type="LABEL" if instruction_type == "ENV" else "ENV",
+                                         value=val)
+                else:
+                    context.set_line_value(context_type=instruction_type, value=val)
 
-            instructions.append(context)
-            last_context = context
+            if i % 3 != 1:
+                instructions.append(context)
+            if i % 2 == 0:
+                last_context = context
         return instructions
