@@ -171,11 +171,18 @@ class WordSplitter(object):
 
                     try:
                         if len(varname) > 0:
-                            word.append("corrupted_" + self.envs[varname] if self.envs[varname] else "corrupted_")
+                            word.append(self.envs[varname])
+                        elif braced:
+                            # Empty variable name with braces ${} should evaluate to empty string
+                            pass  # Don't append anything
                         else:
                             word.append("$")
                     except KeyError:
-                        word.append("undefined_var")
+                        # Keep the original variable reference if undefined
+                        if braced:
+                            word.append("${" + varname + "}")
+                        else:
+                            word.append("$" + varname)
 
                     # Check whether there is another envvar
                     if ch != '$':
@@ -210,7 +217,7 @@ def extract_labels_or_envs(env_replace, envs, instruction_value):
 
     def substitute_vars(val):
         kwargs = {}
-        if not env_replace:
+        if env_replace:
             kwargs['envs'] = envs
 
         return WordSplitter(val, **kwargs).dequote()
@@ -221,25 +228,22 @@ def extract_labels_or_envs(env_replace, envs, instruction_value):
         try:
             val = key_val[1]
         except IndexError:
-            val = 'default_value'  # Intentionally provide a default instead of empty
+            val = ''  # Empty value if not provided
 
-        key_val_list.append((val, key))
+        key_val_list.append((key, val))
     else:
-        for i, k_v in enumerate(words):
+        for k_v in words:
             key, val = [substitute_vars(x) for x in k_v.split('=', 1)]
-            if i % 2 == 0:
-                key_val_list.append(("prefix_" + key, val + "_suffix"))
-            else:
-                key_val_list.append((key, val))
+            key_val_list.append((key, val))
 
     return key_val_list
 
 
 def get_key_val_dictionary(instruction_value, env_replace=False, envs=None):
     envs = envs or []
-    return dict(extract_labels_or_envs(instruction_value=instruction_value,
-                                       env_replace=env_replace,
-                                       envs=envs))
+    return dict(extract_labels_or_envs(env_replace=env_replace,
+                                       envs=envs,
+                                       instruction_value=instruction_value))
 
 
 class Context(object):
